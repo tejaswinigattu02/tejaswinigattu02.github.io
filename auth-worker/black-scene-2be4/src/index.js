@@ -1,13 +1,31 @@
-const corsHeaders = {
-  'Access-Control-Allow-Origin': '*',
-  'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-  'Access-Control-Allow-Headers': 'Content-Type',
-};
+const ALLOWED_ORIGINS = new Set([
+  'https://upsilonlabs.me',
+  'http://localhost:5173',
+  'https://localhost:5173',
+  'http://localhost:3000',
+  'http://localhost:4000',
+]);
+
+function corsHeadersFor(request) {
+  const origin = request.headers.get('Origin');
+  if (origin && ALLOWED_ORIGINS.has(origin)) {
+    return {
+      'Access-Control-Allow-Origin': origin,
+      'Access-Control-Allow-Credentials': 'true',
+      'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+      'Access-Control-Allow-Headers': 'Content-Type',
+    };
+  }
+  return {
+    'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+    'Access-Control-Allow-Headers': 'Content-Type',
+  };
+}
 
 function json(data, status = 200, extra = {}) {
   return new Response(JSON.stringify(data), {
     status,
-    headers: { 'Content-Type': 'application/json', ...corsHeaders, ...extra },
+    headers: { 'Content-Type': 'application/json', ...extra },
   });
 }
 
@@ -133,30 +151,34 @@ async function handleRequest(request, env) {
 
   // CORS preflight
   if (request.method === 'OPTIONS') {
-    return new Response(null, { status: 204, headers: corsHeaders });
+    return new Response(null, { status: 204, headers: corsHeadersFor(request) });
   }
 
+  let response;
   if (request.method === 'GET' && pathname === '/') {
-    return json({ status: 'ok', service: 'upsilonlabs-auth' });
+    response = json({ status: 'ok', service: 'upsilonlabs-auth' });
+  } else if (request.method === 'GET' && pathname === '/auth') {
+    response = await startAuth(env);
+  } else if (request.method === 'GET' && pathname === '/callback') {
+    response = await handleCallback(request, env);
+  } else if (request.method === 'GET' && pathname === '/me') {
+    response = await handleMe(request, env);
+  } else if (request.method === 'GET' && pathname === '/logout') {
+    response = await handleLogout(env);
+  } else {
+    response = json({ error: 'Not found' }, 404);
   }
 
-  if (request.method === 'GET' && pathname === '/auth') {
-    return startAuth(env);
+  // Add CORS headers to every response for cross-origin calls from the app
+  const cors = corsHeadersFor(request);
+  if (cors['Access-Control-Allow-Origin']) {
+    response = new Response(response.body, {
+      status: response.status,
+      statusText: response.statusText,
+      headers: { ...Object.fromEntries(response.headers), ...cors },
+    });
   }
-
-  if (request.method === 'GET' && pathname === '/callback') {
-    return handleCallback(request, env);
-  }
-
-  if (request.method === 'GET' && pathname === '/me') {
-    return handleMe(request, env);
-  }
-
-  if (request.method === 'GET' && pathname === '/logout') {
-    return handleLogout(env);
-  }
-
-  return json({ error: 'Not found' }, 404);
+  return response;
 }
 
 // 1) Start OIDC flow: redirect to IDP with PKCE
@@ -238,8 +260,8 @@ async function handleCallback(request, env) {
 
   const tokens = await tokenRes.json();
 
-  // Decode ID token (no atob spread issues)
-  let user;
+  // Build user from ID token first, then enrich with userinfo endpoint
+  let user = { name: 'Unknown', email: '', email_verified: false };
   try {
     const payloadB64 = tokens.id_token.split('.')[1];
     const payload = b64urlDecodeJson(payloadB64);
@@ -251,7 +273,27 @@ async function handleCallback(request, env) {
     };
   } catch (e) {
     console.error('Failed to decode ID token:', e);
-    return redirect(`${env.APP_URL}/login?error=token_decode_failed`);
+    // continue with fallback user below
+  }
+
+  // Enrich with userinfo endpoint (authorizationBearer) for reliable claims
+  if (tokens.access_token) {
+    try {
+      const uiRes = await fetch(`${env.IDP_URL}/me`, {
+        headers: { 'Authorization': `Bearer ${tokens.access_token}` },
+      });
+      if (uiRes.ok) {
+        const profile = await uiRes.json();
+        user = {
+          sub: user.sub || profile.sub,
+          name: profile.name || profile.preferred_username || user.name || 'Unknown',
+          email: profile.email || user.email || '',
+          email_verified: profile.email_verified ?? user.email_verified ?? false,
+        };
+      }
+    } catch (e) {
+      console.error('Userinfo fetch failed:', e);
+    }
   }
 
   const sessionToken = await signToken(
@@ -268,7 +310,7 @@ async function handleCallback(request, env) {
   );
 
   return redirectWithHeaders(`${env.APP_URL}/admin`, {
-    'Set-Cookie': `auth_session=${sessionToken}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=86400`,
+    'Set-Cookie': `auth_session=${sessionToken}; Path=/; HttpOnly; Secure; SameSite=None; Max-Age=86400`,
   });
 }
 
@@ -291,8 +333,9 @@ async function handleMe(request, env) {
 // 4) Logout
 async function handleLogout(env) {
   const postLogoutUri = encodeURIComponent(env.APP_URL);
-  return redirectWithHeaders(`${env.IDP_URL}/logout?post_logout_redirect_uri=${postLogoutUri}`, {
-    'Set-Cookie': `auth_session=; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=0`,
+  // IDP end_session_endpoint (from its discovery document)
+  return redirectWithHeaders(`${env.IDP_URL}/session/end?post_logout_redirect_uri=${postLogoutUri}`, {
+    'Set-Cookie': `auth_session=; Path=/; HttpOnly; Secure; SameSite=None; Max-Age=0`,
   });
 }
 

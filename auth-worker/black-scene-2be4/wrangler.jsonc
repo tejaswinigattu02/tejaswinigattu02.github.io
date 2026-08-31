@@ -1,0 +1,20 @@
+/**
+ * For more details on how to configure Wrangler, refer to:
+ * https://developers.cloudflare.com/workers/wrangler/configuration/
+ */
+{
+	"$schema": "node_modules/wrangler/config-schema.json",
+	"name": "upsilonlabs-auth",
+	"main": "src/index.js",
+	"compatibility_date": "2026-08-25",
+	"observability": {
+		"enabled": true
+	},
+	"vars": {
+		"IDP_URL": "https://signfuncapp.blackisland-65d7ed7f.uaenorth.azurecontainerapps.io",
+		"CLIENT_ID": "upsilon",
+		"REDIRECT_URI": "https://upsilonlabs-auth.gattucharanteja8143.workers.dev/callback",
+		"APP_URL": "https://upsilonlabs.me",
+		"SCOPES": "openid profile email offline_access"
+	}
+}
